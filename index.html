@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Printable PLA Tray Generator</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #222; font-family: sans-serif; color: #fff; }
+        #ui { position: absolute; top: 15px; left: 15px; background: rgba(30,30,30,0.85); padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); width: 300px; }
+        h2 { margin: 0 0 15px 0; font-size: 1.2rem; color: #4da6ff; border-bottom: 1px solid #555; padding-bottom: 8px; }
+        .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        input { width: 70px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 4px; text-align: right; }
+        .hint { font-size: 0.8rem; color: #aaa; margin-bottom: 15px; }
+        .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        button { background: #4da6ff; color: #fff; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 0.85rem; }
+        button:hover { background: #3388dd; }
+    </style>
+    <!-- Three.js 0.160.0 ESM モジュール -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+<div id="ui">
+    <h2>PLA Tray Generator</h2>
+    <div class="hint">ドラッグ: 回転 / 右ドラッグ: 移動 / ホイール: 縮尺</div>
+    <div class="row"><label>外径 (mm)</label><input type="number" id="v-dia" value="100" min="20" max="300"></div>
+    <div class="row"><label>高さ (mm)</label><input type="number" id="v-h" value="20" min="5" max="100"></div>
+    <div class="row"><label>底平坦部 (%)</label><input type="number" id="v-flat" value="70" min="10" max="95"></div>
+    <div class="row"><label>縁幅 (mm)</label><input type="number" id="v-rim" value="5" min="1" max="20" step="0.5"></div>
+    
+    <div class="hint" style="margin-top:10px; border-top:1px solid #555; padding-top:10px;">
+        仕様: 壁厚2.0mm / 底厚3.2mm<br>滑らかな曲線接続 / サポート材不要
+    </div>
+    
+    <div class="btns">
+        <button id="b-stl">STL DL</button>
+        <button id="b-obj">OBJ DL</button>
+        <button id="b-gltf">GLTF DL</button>
+        <button id="b-glb">GLB DL</button>
+    </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STLExporter } from 'three/addons/exporters/STLExporter.js';
+import { OBJExporter } from 'three/addons/exporters/OBJExporter.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+let scene, camera, renderer, controls, trayMesh;
+
+init();
+animate();
+
+function init() {
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x222222);
+
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 60, 150);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+
+    scene.add(new THREE.GridHelper(200, 20, 0x555555, 0x444444));
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    
+    const d1 = new THREE.DirectionalLight(0xffffff, 0.8);
+    d1.position.set(50, 100, 50);
+    d1.castShadow = true;
+    scene.add(d1);
+
+    const d2 = new THREE.DirectionalLight(0xffcccc, 0.3);
+    d2.position.set(-50, 50, -50);
+    scene.add(d2);
+
+    createTray();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    ['v-dia', 'v-h', 'v-flat', 'v-rim'].forEach(id => {
+        document.getElementById(id).addEventListener('input', createTray);
+    });
+
+    document.getElementById('b-stl').onclick = () => exportModel('stl');
+    document.getElementById('b-obj').onclick = () => exportModel('obj');
+    document.getElementById('b-gltf').onclick = () => exportModel('gltf');
+    document.getElementById('b-glb').onclick = () => exportModel('glb');
+}
+
+function createTray() {
+    if (trayMesh) {
+        scene.remove(trayMesh);
+        trayMesh.geometry.dispose();
+        trayMesh.material.dispose();
+    }
+
+    const D = Math.max(1, parseFloat(document.getElementById('v-dia').value));
+    const H = Math.max(1, parseFloat(document.getElementById('v-h').value));
+    const botRatio = Math.max(0, Math.min(99, parseFloat(document.getElementById('v-flat').value))) / 100;
+    const rimW = Math.max(0.1, parseFloat(document.getElementById('v-rim').value));
+    
+    const t_wall = 2.0;
+    const t_bot = 3.2;
+
+    const p = 2.5; 
+    const R_max = (D / 2) - (rimW / 2);
+    const x_flat = R_max * botRatio;
+
+    function getH(x) {
+        if (x <= x_flat) return t_bot / 2;
+        const u = (x - x_flat) / (R_max - x_flat);
+        return t_bot / 2 + (H - rimW / 2 - t_bot / 2) * Math.pow(u, p);
+    }
+
+    function getN(x) {
+        if (x <= x_flat) return new THREE.Vector2(0, 1);
+        const u = (x - x_flat) / (R_max - x_flat);
+        const dy = (H - rimW / 2 - t_bot / 2) * p * Math.pow(u, p - 1) / (R_max - x_flat);
+        const len = Math.sqrt(dy * dy + 1);
+        return new THREE.Vector2(-dy / len, 1 / len);
+    }
+
+    const oPts = [], iPts = [];
+    const steps = 60;
+    
+    // 内側と外側のプロファイルを一括計算（肉厚一定と遷移）
+    for (let i = 0; i <= steps; i++) {
+        const x = R_max * (i / steps);
+        const y = getH(x);
+        const n = getN(x);
+        
+        // 底厚(3.2)から壁厚(2.0)へ遷移、最上部で縁幅へ拡張
+        let th = t_bot;
+        if (x > x_flat) {
+            const u = (x - x_flat) / (R_max - x_flat);
+            th = t_bot - (t_bot - t_wall) * Math.pow(u, 1.5);
+            if (u > 0.8) {
+                const ru = (u - 0.8) / 0.2;
+                th += (rimW - th) * Math.pow(ru, 2);
+            }
+        }
+
+        oPts.push(new THREE.Vector2(x - n.x * th / 2, Math.max(0, y - n.y * th / 2)));
+        iPts.push(new THREE.Vector2(x + n.x * th / 2, y + n.y * th / 2));
+    }
+
+    // 最頂点の縁（リム）を滑らかな半円で塞ぐ
+    const cPts = [];
+    const cn = Math.abs(x_flat - R_max) < 1e-6 ? new THREE.Vector2(0, 1) : getN(R_max);
+    
+    // 接線ベクトル(y, -x)
+    const ct = new THREE.Vector2(cn.y, -cn.x).normalize(); 
+    const cCenter = new THREE.Vector2(R_max, H - rimW / 2);
+    const capSteps = 16;
+    
+    for(let i = 1; i < capSteps; i++) {
+        const a = Math.PI * (i / capSteps);
+        cPts.push(new THREE.Vector2(
+            cCenter.x - cn.x * Math.cos(a) * (rimW / 2) + ct.x * Math.sin(a) * (rimW / 2),
+            cCenter.y - cn.y * Math.cos(a) * (rimW / 2) + ct.y * Math.sin(a) * (rimW / 2)
+        ));
+    }
+
+    // X=0から始まりX=0で終わる一筆書きの閉じた配列を構築
+    const pts = [];
+    if(oPts.length > 0) oPts[0].x = 0;
+    pts.push(...oPts, ...cPts);
+    iPts.reverse();
+    if(iPts.length > 0) iPts[iPts.length - 1].x = 0;
+    pts.push(...iPts);
+
+    const geo = new THREE.LatheGeometry(pts, 128); // 滑らかな円周分割
+    geo.computeVertexNormals();
+
+    const mat = new THREE.MeshStandardMaterial({ color: 0xff8c00, roughness: 0.6, metalness: 0.1, side: THREE.DoubleSide });
+    trayMesh = new THREE.Mesh(geo, mat);
+    trayMesh.castShadow = true;
+    trayMesh.receiveShadow = true;
+    scene.add(trayMesh);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// ファイルダウンロード用ユーティリティ関数
+function downloadFile(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// エクスポート処理
+function exportModel(format) {
+    if (!trayMesh) return;
+    
+    if (format === 'stl') {
+        const res = new STLExporter().parse(scene);
+        downloadFile(new Blob([res], { type: 'text/plain' }), 'tray.stl');
+    } else if (format === 'obj') {
+        const res = new OBJExporter().parse(scene);
+        downloadFile(new Blob([res], { type: 'text/plain' }), 'tray.obj');
+    } else if (format === 'gltf' || format === 'glb') {
+        new GLTFExporter().parse(scene, (gltf) => {
+            if (format === 'glb') {
+                downloadFile(new Blob([gltf], { type: 'application/octet-stream' }), 'tray.glb');
+            } else {
+                downloadFile(new Blob([JSON.stringify(gltf, null, 2)], { type: 'application/json' }), 'tray.gltf');
+            }
+        }, err => console.error(err), { binary: format === 'glb' });
+    }
+}
+</script>
+</body>
+</html>
